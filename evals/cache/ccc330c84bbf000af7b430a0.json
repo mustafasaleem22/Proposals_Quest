@@ -1,0 +1,110 @@
+{
+ "step": "brief",
+ "provider": "gemini",
+ "model": "gemini-3.5-flash-lite",
+ "prompt_version": "v2.0.6",
+ "response": {
+  "goal": "We get partnership requests by email. We want each new email in our Partners Gmail label summarized by an AI model and added to Airtable: sender, company, request type, a 2-sentence summary and a priority flag. A person on our team reviews anything marked low confidence.",
+  "plan": [
+   {
+    "step": "Kickoff and requirements review",
+    "tools": [],
+    "suggested_tools": [
+     "Python"
+    ]
+   },
+   {
+    "step": "Build Gmail API integration for the Partners label",
+    "tools": [
+     "Gmail API"
+    ],
+    "suggested_tools": [
+     "Python"
+    ]
+   },
+   {
+    "step": "Implement AI model integration for summarization and extraction",
+    "tools": [
+     "Python"
+    ],
+    "suggested_tools": [
+     "OpenAI API",
+     "Gemini API"
+    ]
+   },
+   {
+    "step": "Configure Airtable output and low-confidence review routing",
+    "tools": [
+     "Airtable"
+    ],
+    "suggested_tools": [
+     "Python"
+    ]
+   },
+   {
+    "step": "Testing and delivery",
+    "tools": [],
+    "suggested_tools": [
+     "Python"
+    ]
+   }
+  ],
+  "milestones": [
+   {
+    "name": "Milestone 1",
+    "deliverable": "Gmail and AI processing setup",
+    "budget_share": "50%"
+   },
+   {
+    "name": "Milestone 2",
+    "deliverable": "Airtable integration and final testing",
+    "budget_share": "50%"
+   }
+  ],
+  "proof_map": [
+   {
+    "step": "Kickoff and requirements review",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Build Gmail API integration for the Partners label",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Implement AI model integration for summarization and extraction",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Configure Airtable output and low-confidence review routing",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Testing and delivery",
+    "project_id": null,
+    "gap": true
+   }
+  ],
+  "risks": [
+   {
+    "risk": "Budget format is hourly rather than fixed.",
+    "mitigation": "Track hours closely and provide regular progress updates to ensure alignment with expected output."
+   },
+   {
+    "risk": "AI model output inconsistency for extracting structured fields like sender and company.",
+    "mitigation": "Implement robust prompt engineering and low-confidence flags for human review."
+   }
+  ],
+  "questions": [
+   "What specific fields are needed in Airtable beyond sender, company, request type, summary, and priority flag?",
+   "What criteria define a low-confidence classification that requires human review?"
+  ],
+  "assumptions": [
+   "The client has existing Gmail and Airtable accounts with appropriate API access.",
+   "The budget is flexible based on the hourly rate of $35\u2013$55 per hour."
+  ]
+ }
+}

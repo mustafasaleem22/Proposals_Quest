@@ -1,0 +1,97 @@
+{
+ "step": "brief",
+ "provider": "gemini",
+ "model": "gemini-3.5-flash-lite",
+ "prompt_version": "v2.0.6",
+ "response": {
+  "goal": "Migrate 6 Zaps from Zapier to a self-hosted n8n instance, including a form to Google Sheets, Sheets to Slack alerts, a Stripe payment to an email receipt, and three small Gmail filters, followed by testing and documentation handover.",
+  "plan": [
+   {
+    "step": "Audit existing 6 Zapier workflows and map out their triggers, actions, and logic for n8n implementation.",
+    "tools": [],
+    "suggested_tools": [
+     "Zapier",
+     "n8n"
+    ]
+   },
+   {
+    "step": "Rebuild the form to Google Sheets workflow and Sheets to Slack alerts workflow in n8n.",
+    "tools": [
+     "Google Sheets API",
+     "Slack API",
+     "n8n"
+    ],
+    "suggested_tools": []
+   },
+   {
+    "step": "Rebuild the Stripe payment to email receipt and the three Gmail filters workflows in n8n.",
+    "tools": [
+     "n8n"
+    ],
+    "suggested_tools": [
+     "Stripe API",
+     "Gmail API"
+    ]
+   },
+   {
+    "step": "Test all 6 rebuilt n8n workflows with the client and create a short handover documentation.",
+    "tools": [
+     "n8n"
+    ],
+    "suggested_tools": []
+   }
+  ],
+  "milestones": [
+   {
+    "name": "Phase 1: Migration and Rebuild",
+    "deliverable": "All 6 workflows successfully rebuilt in self-hosted n8n.",
+    "budget_share": "70%"
+   },
+   {
+    "name": "Phase 2: Testing and Documentation",
+    "deliverable": "Workflows tested with the client and short handover documentation delivered.",
+    "budget_share": "30%"
+   }
+  ],
+  "proof_map": [
+   {
+    "step": "Audit existing 6 Zapier workflows and map out their triggers, actions, and logic for n8n implementation.",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Rebuild the form to Google Sheets workflow and Sheets to Slack alerts workflow in n8n.",
+    "project_id": "P1",
+    "gap": false
+   },
+   {
+    "step": "Rebuild the Stripe payment to email receipt and the three Gmail filters workflows in n8n.",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Test all 6 rebuilt n8n workflows with the client and create a short handover documentation.",
+    "project_id": null,
+    "gap": true
+   }
+  ],
+  "risks": [
+   {
+    "risk": "Access credentials or API permissions for Stripe, Gmail, or the self-hosted n8n instance may not be immediately available during setup.",
+    "mitigation": "Request all necessary API keys, webhook URLs, and credentials prior to kickoff."
+   },
+   {
+    "risk": "Fixed budget of $450 for 6 complex workflows and documentation may require strict scope management.",
+    "mitigation": "Confirm exact Zapier payload structures beforehand to avoid unforeseen edge cases."
+   }
+  ],
+  "questions": [
+   "Do you have admin access ready on the self-hosted n8n instance with all required credentials connected?",
+   "Are there any custom JavaScript code steps or complex multi-step branching in the current Zapier workflows?"
+  ],
+  "assumptions": [
+   "The client will provide access to the existing Zapier account to inspect the 6 Zaps.",
+   "The self-hosted n8n instance is fully installed and operational."
+  ]
+ }
+}

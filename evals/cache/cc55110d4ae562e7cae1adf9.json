@@ -1,0 +1,92 @@
+{
+ "step": "brief",
+ "provider": "gemini",
+ "model": "gemini-3.5-flash-lite",
+ "prompt_version": "v2.0.6",
+ "response": {
+  "goal": "Connect a few of their tools using automation.",
+  "plan": [
+   {
+    "step": "Kickoff and discovery call to identify the tools that need to be connected and map out the required workflows.",
+    "tools": [],
+    "suggested_tools": [
+     "n8n",
+     "Python",
+     "REST APIs"
+    ]
+   },
+   {
+    "step": "Design and build the integration workflows based on the shared tool details.",
+    "tools": [],
+    "suggested_tools": [
+     "n8n",
+     "Webhooks"
+    ]
+   },
+   {
+    "step": "Test the automations with sample data to ensure reliable execution and error handling.",
+    "tools": [],
+    "suggested_tools": [
+     "n8n"
+    ]
+   },
+   {
+    "step": "Handover and review of the completed integrations with the client.",
+    "tools": [],
+    "suggested_tools": []
+   }
+  ],
+  "milestones": [
+   {
+    "name": "Discovery and Architecture",
+    "deliverable": "Detailed integration plan and confirmed list of tools to connect.",
+    "budget_share": "30%"
+   },
+   {
+    "name": "Build and Test",
+    "deliverable": "Functional automation workflows tested and verified.",
+    "budget_share": "70%"
+   }
+  ],
+  "proof_map": [
+   {
+    "step": "Kickoff and discovery call to identify the tools that need to be connected and map out the required workflows.",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Design and build the integration workflows based on the shared tool details.",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Test the automations with sample data to ensure reliable execution and error handling.",
+    "project_id": null,
+    "gap": true
+   },
+   {
+    "step": "Handover and review of the completed integrations with the client.",
+    "project_id": null,
+    "gap": true
+   }
+  ],
+  "risks": [
+   {
+    "risk": "The budget is not stated beyond a $5 placeholder.",
+    "mitigation": "Clarify the actual project scope and budget requirements before starting work."
+   },
+   {
+    "risk": "Tool details are not specified in the job post.",
+    "mitigation": "Request the list of tools and API documentation during the initial discovery phase."
+   }
+  ],
+  "questions": [
+   "What specific tools and applications need to be connected?",
+   "What is the expected volume of data or frequency for these automations?"
+  ],
+  "assumptions": [
+   "The budget is not stated and will be negotiated based on the specific tools and complexity.",
+   "The client will provide access credentials and documentation for the tools that need to be connected."
+  ]
+ }
+}

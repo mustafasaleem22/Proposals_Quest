@@ -1,0 +1,458 @@
+"""The v2 path: link check → duplicate check → extraction (LLM) → user confirms →
+trust + budget gate (code) → assessment (LLM) → decision (code) → Solution Brief (LLM) →
+proposal (LLM) → claim check (LLM lists + code) → one retry → user edits and sends.
+
+Every step that can stop the job raises an error with a plain message for the user.
+"""
+from __future__ import annotations
+
+import difflib
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from . import prompts
+from .config import load_config
+from .contracts import (ClientProfile, Assessment, Brief, ClaimLists, CVImport, Decision, Extraction, JobPost, Profile, Project,
+                        ProposalDraft, ProposalRecord, ProposalVersion, now_iso)
+from .decision import majority, proof_label, budget_gate, decide, fit_result, pre_decision
+from .links import LinkError, ParsedLink, parse_link, title_match
+from .llm import LLM
+from .policy import apply_policy
+from .skills import overlap, overlap_text
+from .storage import Storage
+from .trust import score_client
+from .validators import failures_for_retry, validate
+
+
+SENT_LOG_HEADER = ["Date sent", "Job", "Link", "v2's call", "You overrode it", "Client trust", "Proof", "Minutes, job added to sent",
+                   "How much of the draft you changed", "Outcome"]
+SENT_LOG_WIDTHS = [13, 40, 45, 18, 15, 13, 14, 14, 18, 14]
+
+
+def _call(d) -> str:
+    """v2's recommendation in words, for the sent log."""
+    if d is None:
+        return ""
+    if d.code == "unchecked":
+        return "Fit check skipped"
+    return {"apply": "Apply", "apply_with_questions": "Apply with questions", "skip": "Skip"}[d.decision]
+
+
+def _tags_in_project(tags: list[str], project: Project) -> int:
+    """How many of the post's skill tags the project mentions in its own words (title, problem, what was done, skills).
+    A vague post like "Automation · API Integration" is matched on what the project was, not on alias lookups."""
+    import re
+
+    text = "\n".join([project.title, project.problem, project.what_i_did, " ".join(project.skills)]).lower()
+    return sum(1 for t in tags if t.strip() and re.search(r"(?<![a-z0-9])" + re.escape(t.strip().lower()) + r"s?(?![a-z0-9])", text))
+
+
+def _specific_tags_in_project(job: JobPost, project: Project) -> int:
+    """Specific tools named in the post that the project also names: not generic words, and not the tools a
+    freelancer builds with (n8n, Python...), which say nothing about the client's systems or records (F7)."""
+    from .skills import is_generic, norm
+
+    build = {norm(t) for t in load_config()["skills"].get("build_tools", [])}
+    tags = [t for t in [*job.skills, *job.client_tools] if t.strip() and not is_generic(t) and norm(t) not in build]
+    return _tags_in_project(tags, project)
+
+
+def _label_projects(rec: ProposalRecord, projects: list[Project]) -> None:
+    """The proof label for each project comes from the facts, by rule, never from the model's own label."""
+    by_id = {pr.id: pr for pr in projects}
+    split = set(rec.assessment.split_facts or [])
+    for j in rec.assessment.project_labels:
+        j.label = proof_label(j)
+        if j.label != "similar":
+            continue
+        # "Similar" needs evidence in both texts: a specific tool the post names that the project also used.
+        # A post that names none (only "Automation", "API Integration") can't be "nearly this".
+        if j.project_id in by_id and not _specific_tags_in_project(rec.job, by_id[j.project_id]):
+            j.label = "same_skills"
+            continue
+        # And the fact that makes it "similar" (same platform or same records) has to hold in every check,
+        # not just the majority: "nearly this" is the strongest claim a draft makes (E3, T02's "same records").
+        firm = [name for field, name in (("same_platform", "same platform"), ("same_records", "same records"))
+                if getattr(j, field) and f"{j.project_id} {name}" not in split]
+        no_facts = j.same_platform is None and j.same_records is None  # the model's own label stands (old runs)
+        if not firm and not no_facts:
+            j.label = "same_skills"
+
+
+class PipelineError(Exception):
+    """Shown to the user as written."""
+
+
+class DuplicateJob(PipelineError):
+    def __init__(self, record: ProposalRecord):
+        super().__init__("You already have a draft for this job.")
+        self.record = record
+
+
+class Pipeline:
+    def __init__(self, storage: Storage, llm: LLM, uid: str):
+        self.storage, self.llm, self.uid = storage, llm, uid
+
+    # ------------------------------------------------------------------ data
+    def profile(self) -> Profile:
+        return self.storage.get_profile(self.uid) or Profile()
+
+    def projects(self) -> list[Project]:
+        return self.storage.get_projects(self.uid)
+
+    def project(self, project_id: Optional[str]) -> Optional[Project]:
+        return next((p for p in self.projects() if p.id == project_id), None) if project_id else None
+
+    # ------------------------------------------------------------------ intake
+    def check_link(self, link: str) -> ParsedLink:
+        """Step 1 of the link check, then the duplicate check. Runs before any LLM call."""
+        parsed = parse_link(link)  # raises LinkError
+        existing = self.storage.get_proposal(self.uid, parsed.job_key)
+        if existing:
+            raise DuplicateJob(existing)
+        return parsed
+
+    def extract(self, link: str, job_details: str, client_box: str = "") -> ProposalRecord:
+        parsed = self.check_link(link)
+        if len((job_details or "").strip()) < 40:
+            raise PipelineError("Paste the whole job post into Job details, client box included.")
+        system, user = prompts.extraction(parsed.url, parsed.platform, job_details, client_box)
+        ex = self.llm.call("extract", "light", system, user, Extraction, load_config()["models"]["temperature_extract"])
+        if not ex.title.strip() or not ex.description.strip():
+            raise PipelineError("No job title or description was found in the paste. Copy the job's own page and try again.")
+        allowed, refused, ignored, flags = apply_policy(ex.instructions, ex.red_flags, ex.description)
+        job = JobPost(
+            job_key=parsed.job_key, platform=parsed.platform if parsed.platform in
+            ("upwork", "freelancer", "guru") else "other",
+            link=parsed.url, source="paste", title=ex.title, description=ex.description, budget=ex.budget,
+            skills=ex.skills, screening_questions=ex.screening_questions, explicit_requirements=ex.explicit_requirements,
+            client_tools=ex.client_tools, allowed_instructions=allowed, refused_instructions=refused,
+            ignored_instructions=ignored, red_flags=flags, link_status=title_match(parsed, ex.title), raw_text=job_details,
+        )
+        rec = ProposalRecord(uid=self.uid, job_key=job.job_key, job=job, client=ex.client)
+        if ignored:
+            rec.events.append({"at": now_iso(), "type": "ignored_ai_instruction", "text": [i.text for i in ignored]})
+        if refused:
+            rec.events.append({"at": now_iso(), "type": "refused_claim_instruction", "text": [i.text for i in refused]})
+        # Keep only sections that really are in the paste: models tend to echo the prompt's examples.
+        seen = [sec for sec in ex.ignored_sections if sec.strip() and sec.strip().lower() in job_details.lower()]
+        if seen:
+            rec.events.append({"at": now_iso(), "type": "ignored_sections", "text": seen})
+        return rec
+
+    def from_fetched(self, job: JobPost, client: Optional[ClientProfile] = None) -> ProposalRecord:
+        """Fetched jobs skip the link check: link and details come from the same API response."""
+        existing = self.storage.get_proposal(self.uid, job.job_key)
+        if existing:
+            raise DuplicateJob(existing)
+        return ProposalRecord(uid=self.uid, job_key=job.job_key, job=job, client=client or ClientProfile())
+
+    # ------------------------------------------------------------------ decide
+    def decide(self, rec: ProposalRecord, check: bool = True, reuse_assessment: bool = False) -> ProposalRecord:
+        """Called once the user confirms the extracted fields. With check=False the user skips the
+        fit check: no assessment call and no Skip, but red flags and a low budget still show as warnings."""
+        t0 = time.monotonic()
+        profile = self.profile()
+        flags = [f.kind for f in rec.job.red_flags]
+        rec.trust = score_client(rec.client, flags, profile.trust_cutoffs or None, rec.job.platform)
+        gate, gate_text = budget_gate(rec.job.budget, profile)
+        red_text = next((f"the post says \"{f.evidence.strip().rstrip('.!')[:120]}\"" for f in rec.job.red_flags), "")
+        if not check:
+            warnings = []
+            if rec.trust.band == "Red flag":
+                warnings.append(f"red-flag client: {red_text or rec.trust.reasons[0]}")
+            if gate == "below_minimum":
+                warnings.append(f"the budget is below your minimum ({gate_text})")
+            rec.decision = Decision(decision="apply", code="unchecked", budget_gate=gate,
+                                    reason="Not checked: you chose to write the proposal without the fit check.",
+                                    card_note="; ".join(warnings) or None)
+            self._pick_proof(rec)
+            rec.events.append({"at": now_iso(), "type": "fit_check_skipped"})
+            rec.status = "decided"
+            self.storage.put_proposal(rec)
+            return rec
+        d = pre_decision(rec.trust, gate, gate_text, red_text)
+        ran_check = False
+        if d is None:
+            projects = self.projects()
+            ran_check = not (reuse_assessment and rec.assessment)
+            if ran_check:
+                system, user = prompts.assessment(rec.job, profile, projects)
+                m = load_config()["models"]
+                runs = [self.llm.call("assess", "light", system, user, Assessment, m["temperature_extract"])]
+                for i in range(2, int(m.get("assess_votes", 1)) + 1):
+                    # Separate runs (distinct prompt tail, so the cache keeps each), then the majority per fact.
+                    runs.append(self.llm.call("assess", "light", system, user + f"\n\n(Independent check {i}.)",
+                                              Assessment, m.get("temperature_vote", 0.3)))
+                rec.assessment = majority(runs)
+            _label_projects(rec, projects)
+            if gate in ("placeholder", "none_stated") and not rec.assessment.realistic_yes:
+                # The rule, not the model, decides this: a placeholder or missing budget says nothing about scope.
+                rec.assessment.realistic_yes = True
+                rec.assessment.realistic_reason = "No real budget to judge against (missing or a placeholder), so assumed realistic; ask what they'll pay."
+            proof = any(l.label in ("similar", "same_skills") for l in rec.assessment.project_labels
+                        if any(p.id == l.project_id for p in projects))
+            have = profile.skills + [s for p in projects for s in p.skills]
+            fit = fit_result(rec.assessment, proof, overlap_text(rec.job.skills, have))
+            d = decide(rec.trust, gate, gate_text, fit)
+            self._pick_proof(rec)
+        rec.decision = d
+        if ran_check or not reuse_assessment:
+            rec.check_seconds = round(time.monotonic() - t0, 1)
+        rec.status = "skipped" if d.decision == "skip" else "decided"
+        self.storage.put_proposal(rec)
+        return rec
+
+    def update_client(self, rec: ProposalRecord, client: ClientProfile) -> ProposalRecord:
+        """The user fixed the client's details after the check: re-score trust and redo the call with the
+        same fit facts (no model call). An override, a skipped fit check or a sent job keeps its call."""
+        rec.client = client
+        rec.events.append({"at": now_iso(), "type": "client_edited"})
+        d = rec.decision
+        if d is None or d.overridden or d.code == "unchecked" or rec.status == "sent":
+            flags = [f.kind for f in rec.job.red_flags]
+            rec.trust = score_client(client, flags, self.profile().trust_cutoffs or None, rec.job.platform)
+            self.storage.put_proposal(rec)
+            return rec
+        status, chosen, framing, extra = rec.status, rec.chosen_proof, rec.framing, rec.extra_proof
+        rec = self.decide(rec, check=True, reuse_assessment=True)
+        if rec.versions:  # keep the drafts' proof and status
+            rec.chosen_proof, rec.framing, rec.extra_proof = chosen, framing, extra
+            if rec.status == "decided" and status == "drafted":
+                rec.status = "drafted"
+            self.storage.put_proposal(rec)
+        return rec
+
+    def recheck(self, rec: ProposalRecord) -> ProposalRecord:
+        """Runs the fit check again on a saved job with the current settings and projects (after adding a skill
+        or a project, or when the check was skipped). Drafts are kept; the old decision is logged."""
+        if rec.status == "sent":
+            raise PipelineError("This job is already marked as sent, so its check stays as it was.")
+        old = rec.decision.decision if rec.decision else None
+        rec.events.append({"at": now_iso(), "type": "fit_rechecked", "from": old,
+                           "from_code": rec.decision.code if rec.decision else None})
+        rec.assessment = None
+        return self.decide(rec, check=True)
+
+    def _pick_proof(self, rec: ProposalRecord) -> None:
+        """Honours the confirm screen's choice: v2 picks, the user's own projects, or no project at all."""
+        ids = {p.id for p in self.projects()}
+        if rec.proof_choice == "none":
+            rec.chosen_proof, rec.framing, rec.extra_proof = None, "plan_only", []
+            return
+        if rec.proof_choice == "manual":
+            picked = [i for i in rec.manual_proof if i in ids][:3]
+            if picked:
+                label = next((l.label for l in (rec.assessment.project_labels if rec.assessment else [])
+                              if l.project_id == picked[0]), None)
+                rec.chosen_proof, rec.extra_proof = picked[0], picked[1:]
+                rec.framing = "similar" if label == "similar" else "same_skills"  # unrated: the cautious framing
+                return
+        rec.chosen_proof, rec.framing = self.suggested_proof(rec)
+        rec.extra_proof = []
+
+    def suggested_proof(self, rec: ProposalRecord) -> tuple[Optional[str], str]:
+        if not rec.assessment:
+            # No assessment (fit check skipped): pick the project with the most skill overlap, and frame it
+            # conservatively as same-skills, since nothing has judged it "similar". The user can switch it.
+            best, best_n = None, 0
+            for p in self.projects():
+                n = overlap(rec.job.skills, p.skills)[0]
+                if n > best_n:
+                    best, best_n = p.id, n
+            return (best, "same_skills") if best else (None, "plan_only")
+        projects = {p.id: p for p in self.projects()}
+        for label in ("similar", "same_skills"):
+            cands = [l for l in rec.assessment.project_labels if l.label == label and l.project_id in projects]
+            if cands:
+                # Ties: the same kind of work first, then platform, records, then skill-tag overlap with the post.
+                # Same kind of work first, then how many of the post's own tools the project used, then platform and records.
+                best = max(cands, key=lambda l: (bool(l.same_kind_of_work),
+                                                 _tags_in_project(rec.job.skills, projects[l.project_id]),
+                                                 bool(l.same_platform), bool(l.same_records),
+                                                 overlap(rec.job.skills, projects[l.project_id].skills)[0],
+                                                 -rec.assessment.project_labels.index(l)))
+                return best.project_id, label
+        return None, "plan_only"
+
+    def override(self, rec: ProposalRecord, reason: str = "") -> ProposalRecord:
+        rec.decision.overridden = True
+        rec.decision.override_reason = reason
+        rec.events.append({"at": now_iso(), "type": "override", "from": rec.decision.decision, "reason": reason})
+        rec.status = "decided"
+        if rec.assessment is None:
+            # Skipped before the assessment ran (red flag or below minimum): assess now, so proof can be suggested.
+            system, user = prompts.assessment(rec.job, self.profile(), self.projects())
+            rec.assessment = self.llm.call("assess", "light", system, user, Assessment, 0.0)
+            _label_projects(rec, self.projects())  # same rules as the fit check, so an override can't skip them
+            self._pick_proof(rec)
+        self.storage.put_proposal(rec)
+        return rec
+
+    # ------------------------------------------------------------------ write
+    def write(self, rec: ProposalRecord, project_id: Optional[str] = "auto", comment: str = "",
+              extra_ids: Optional[list[str]] = None) -> ProposalRecord:
+        """Solution Brief, then the proposal, then the claim check with one retry."""
+        t0 = time.monotonic()
+        profile = self.profile()
+        if project_id == "auto":
+            project_id, framing = rec.chosen_proof, rec.framing or "plan_only"
+            if project_id is None and rec.assessment and rec.proof_choice == "auto":
+                project_id, framing = self.suggested_proof(rec)
+        else:
+            label = next((l.label for l in (rec.assessment.project_labels if rec.assessment else []) if l.project_id == project_id), None)
+            framing = "plan_only" if project_id is None else ("similar" if label == "similar" else "same_skills")
+            rec.proof_choice = "manual" if project_id else "none"  # the user's own pick from now on
+            rec.manual_proof = [i for i in [project_id, *(extra_ids or [])] if i]
+        project = self.project(project_id)
+        if project is None:
+            project_id, framing = None, "plan_only"
+        if extra_ids is None:
+            extra_ids = rec.extra_proof if project_id == rec.chosen_proof else []
+        extras = [x for x in (self.project(i) for i in extra_ids[:2] if i and i != project_id) if x] if project else []
+        cfg = load_config()
+        temp = cfg["models"]["temperature_draft"]
+        system, user = prompts.brief(rec.job, profile, project, framing, extras)
+        rec.brief = self.llm.call("brief", "draft", system, user, Brief, temp)
+        mode = "questions_first" if rec.decision and rec.decision.decision == "apply_with_questions" else "full"
+        outside = bool(rec.decision and rec.decision.overridden and rec.decision.code == "work_type")
+        max_words = cfg["length"]["questions_first_max_words" if mode == "questions_first" else "proposal_max_words"]
+
+        system, user = prompts.proposal(rec.job, profile, project, framing, rec.brief, mode, max_words, extras=extras,
+                                        outside_work=outside)
+        draft = self.llm.call("proposal", "draft", system, user, ProposalDraft, temp)
+        report = self._check(draft, rec.job, project, profile, mode, extras)
+        if not report.ok:
+            fails = failures_for_retry(report)
+            system, user = prompts.proposal(rec.job, profile, project, framing, rec.brief, mode, max_words, fails, draft.text,
+                                            extras=extras, outside_work=outside)
+            draft = self.llm.call("proposal_retry", "draft", system, user, ProposalDraft, temp)
+            report = self._check(draft, rec.job, project, profile, mode, extras)
+            report.retried = True
+        rec.chosen_proof, rec.framing = project_id, framing
+        rec.extra_proof = [x.id for x in extras]
+        rec.versions.append(ProposalVersion(n=len(rec.versions) + 1, framing=framing, project_id=project_id, mode=mode,
+                                            extra_project_ids=[x.id for x in extras],
+                                            text=draft.text, screening_answers=draft.screening_answers,
+                                            validation=report, comment=comment, seconds=round(time.monotonic() - t0, 1)))
+        rec.status = "drafted"
+        self.storage.put_proposal(rec)
+        return rec
+
+    def revise(self, rec: ProposalRecord, comment: str, current_text: Optional[str] = None) -> ProposalRecord:
+        """Rewrites only what the comment asks, then re-runs the claim check."""
+        t0 = time.monotonic()
+        v = rec.latest()
+        if not v:
+            raise PipelineError("Write a draft first.")
+        profile = self.profile()
+        project = self.project(v.project_id)
+        extras = [x for x in (self.project(i) for i in v.extra_project_ids) if x]
+        system, user = prompts.revise(rec.job, profile, project, current_text or v.text, v.screening_answers, comment, extras)
+        draft = self.llm.call("revise", "draft", system, user, ProposalDraft, load_config()["models"]["temperature_draft"])
+        report = self._check(draft, rec.job, project, profile, v.mode, extras)
+        rec.versions.append(ProposalVersion(n=len(rec.versions) + 1, framing=v.framing, project_id=v.project_id, mode=v.mode,
+                                            extra_project_ids=v.extra_project_ids,
+                                            text=draft.text, screening_answers=draft.screening_answers,
+                                            validation=report, comment=comment, seconds=round(time.monotonic() - t0, 1)))
+        self.storage.put_proposal(rec)
+        return rec
+
+    def _check(self, draft: ProposalDraft, job: JobPost, project: Optional[Project], profile: Profile, mode: str, extras=()):
+        system, user = prompts.claim_lists(draft.text, draft.screening_answers, project, job.user_notes, extras)
+        claims = self.llm.call("claims", "light", system, user, ClaimLists, 0.0)
+        return validate(draft.text, draft.screening_answers, job, project, profile, claims, mode, tuple(extras))
+
+    # ------------------------------------------------------------------ send and outcomes
+    def mark_sent(self, rec: ProposalRecord, sent_text: str) -> tuple[ProposalRecord, str]:
+        v = rec.latest()
+        now = datetime.now(timezone.utc)
+        created = datetime.fromisoformat(rec.created_at)
+        rec.outcome.sent_at = now.isoformat(timespec="seconds")
+        rec.outcome.minutes_paste_to_sent = round((now - created).total_seconds() / 60, 1)
+        rec.outcome.ai_draft = v.text if v else ""
+        rec.outcome.sent_text = sent_text
+        if v:
+            rec.outcome.edit_share = round(1 - difflib.SequenceMatcher(None, v.text, sent_text).ratio(), 3)
+        rec.status = "sent"
+        self.storage.put_proposal(rec)
+        return rec, "Saved as sent."
+
+    def _sent_rows(self) -> list[list]:
+        rows = []
+        for r in sorted(self.storage.list_proposals(self.uid), key=lambda r: r.outcome.sent_at or ""):
+            if r.status != "sent":
+                continue
+            o = r.outcome
+            sent = datetime.fromisoformat(o.sent_at).date() if o.sent_at else None
+            mins = None if o.minutes_paste_to_sent is None else round(o.minutes_paste_to_sent)
+            rows.append([sent, r.job.title, r.job.link, _call(r.decision),
+                         "Yes" if r.decision and r.decision.overridden else "",
+                         r.trust.band if r.trust else "", (r.framing or "").replace("_", " "),
+                         mins, o.edit_share, (o.result or "").replace("_", " ")])
+        return rows
+
+    def sent_log_csv(self) -> str:
+        """Every sent proposal as CSV."""
+        import csv
+        import io
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(SENT_LOG_HEADER)
+        for row in self._sent_rows():
+            row[0] = row[0].strftime("%d %b %Y") if row[0] else ""
+            row[8] = "" if row[8] is None else f"{row[8]:.0%}"
+            w.writerow(row)
+        return buf.getvalue()
+
+    def sent_log_xlsx(self) -> bytes:
+        """Every sent proposal as an Excel file with readable dates, widths and a % column (the My jobs download)."""
+        import io
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sent"
+        ws.append(SENT_LOG_HEADER)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+        for row in self._sent_rows():
+            ws.append(row)
+        for i, width in enumerate(SENT_LOG_WIDTHS, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+        for cell in ws["A"][1:]:
+            cell.number_format = "d mmm yyyy"
+        for cell in ws["I"][1:]:
+            cell.number_format = "0%"
+        ws.freeze_panes = "A2"
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def set_outcome(self, rec: ProposalRecord, result: str) -> ProposalRecord:
+        rec.outcome.result = result
+        rec.outcome.result_at = now_iso()
+        self.storage.put_proposal(rec)
+        return rec
+
+    @staticmethod
+    def still_waiting(rec: ProposalRecord) -> bool:
+        if rec.status != "sent" or rec.outcome.result or not rec.outcome.sent_at:
+            return False
+        days = (datetime.now(timezone.utc) - datetime.fromisoformat(rec.outcome.sent_at)).days
+        return days >= load_config()["outcomes"]["still_waiting_days"]
+
+    # ------------------------------------------------------------------ CV import
+    def propose_projects(self, cv_text: str) -> CVImport:
+        if len(cv_text.strip()) < 40:
+            raise PipelineError("Paste more of your CV or portfolio, or upload a PDF with selectable text.")
+        system, user = prompts.cv_import(cv_text)
+        return self.llm.call("cv_import", "light", system, user, CVImport, 0.0)
+
+
+__all__ = ["Pipeline", "PipelineError", "DuplicateJob", "LinkError"]
